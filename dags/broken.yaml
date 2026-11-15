@@ -1,0 +1,12 @@
+name: broken_daily
+schedule: day
+tasks:
+  - name: extract
+    script: always_fail.py
+    retries: 0
+  - name: transform
+    script: transform.py
+    depends_on: [extract]
+  - name: load
+    script: load.py
+    depends_on: [transform]
