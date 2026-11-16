@@ -30,15 +30,13 @@ def test_failure_skips_direct_downstream():
     assert st["b"] == Status.SKIPPED
 
 
-def test_failure_does_not_propagate_beyond_one_level():
-    """当前实现只处理一层，隔代下游仍然是 PENDING。
-
-    这个测试记录的是现状；改成递归传播后需要同步更新。
-    """
+def test_failure_propagates_transitively():
+    """失败会沿依赖链递归传播，隔代下游同样被跳过。"""
     d = make_dag()
     st = {"a": Status.FAILED, "b": Status.PENDING, "c": Status.PENDING}
     propagate_failure(d, st)
-    assert st["c"] == Status.PENDING
+    assert st["b"] == Status.SKIPPED
+    assert st["c"] == Status.SKIPPED
 
 
 def test_is_done():

@@ -1,0 +1,29 @@
+name: sharded_daily
+schedule: hour
+tasks:
+  # map：按分区展开成多个实例。run 结束后会写出分区清单，
+  # 下一次运行（或续跑）可据此看到展开结果变化。
+  - name: extract
+    script: extract.py
+
+  - name: transform
+    script: transform_shard.py
+    depends_on: [extract]
+    retries: 1
+    sla_seconds: 10
+    params:
+      stage: transform
+    expand:
+      path: /tmp/weave/data/shards_{ds}.json
+      key: shard
+      name: "transform[{key}]"
+
+  # reduce：只有在 transform 的全部实例成功后才就绪。
+  # 通过 WEAVE_UPSTREAM_SUMMARY 读取实例汇总状态。
+  - name: aggregate
+    script: aggregate.py
+    depends_on: [transform]
+
+  - name: check
+    script: check_sharded.py
+    depends_on: [aggregate]

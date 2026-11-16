@@ -7,6 +7,8 @@ from pathlib import Path
 
 import yaml
 
+from .expand import ExpandSpec, parse_spec, validate_spec
+
 
 @dataclass
 class Task:
@@ -16,6 +18,8 @@ class Task:
     retries: int = 0
     sla_seconds: int = 0
     params: dict[str, str] = field(default_factory=dict)
+    # 动态展开声明；None 表示一个任务只有一个实例。
+    expand: ExpandSpec | None = None
 
 
 @dataclass
@@ -56,6 +60,7 @@ def load(path: Path) -> DAG:
 
     tasks: list[Task] = []
     for item in raw["tasks"]:
+        raw_expand = item.get("expand")
         tasks.append(
             Task(
                 name=item["name"],
@@ -64,6 +69,7 @@ def load(path: Path) -> DAG:
                 retries=int(item.get("retries", 0)),
                 sla_seconds=int(item.get("sla_seconds", 0)),
                 params=dict(item.get("params", {})),
+                expand=parse_spec(raw_expand) if raw_expand is not None else None,
             )
         )
     return DAG(name=raw["name"], tasks=tasks, schedule=raw.get("schedule", ""))
@@ -81,6 +87,18 @@ def validate(dag: DAG) -> list[str]:
         for dep in t.depends_on:
             if dep not in known:
                 problems.append(f"task {t.name!r} depends on unknown {dep!r}")
+        if t.expand is not None:
+            problems.extend(f"task {t.name!r}: {p}" for p in validate_spec(t.expand))
+            if t.expand.name and "{key}" not in t.expand.name:
+                problems.append(
+                    f"task {t.name!r}: expand.name must contain '{{key}}' "
+                    "so instances get distinct names"
+                )
+        if t.params:
+            # 避免非标量参数落进环境变量。
+            for k, v in t.params.items():
+                if isinstance(v, (dict, list)):
+                    problems.append(f"task {t.name!r}: param {k!r} must be a scalar")
 
     if not problems:
         order = dag.order()

@@ -59,10 +59,27 @@ def cmd_run(args) -> int:
         return 1
     store = Store(DB_PATH)
     ds = args.ds or schedule.ds_of(time.time())
-    run_id, statuses = run_dag(d, store, ds, JOBS, timeout=args.timeout)
+    try:
+        run_id, statuses = run_dag(
+            d, store, ds, JOBS, timeout=args.timeout,
+            run_id=args.run_id or None, resume=args.resume,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     print(json.dumps({"run_id": run_id, "ds": ds, "statuses": statuses},
                      ensure_ascii=False, indent=2))
     return 0 if all(v == "success" for v in statuses.values()) else 1
+
+
+def cmd_status(args) -> int:
+    store = Store(DB_PATH)
+    detail = store.run_detail(args.run_id)
+    if detail is None:
+        print(f"run not found: {args.run_id}", file=sys.stderr)
+        return 2
+    print(json.dumps(detail, ensure_ascii=False, indent=2, default=str))
+    return 0
 
 
 def cmd_serve(args) -> int:
@@ -85,7 +102,15 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("dag")
     r.add_argument("--ds", default="")
     r.add_argument("--timeout", type=int, default=60)
+    r.add_argument("--run-id", default="",
+                   help="在指定 run 上续跑（只执行未成功/变化的实例）")
+    r.add_argument("--resume", action="store_true",
+                   help="续跑同 DAG、同 ds 的最近一次 run")
     r.set_defaults(func=cmd_run)
+
+    st = sub.add_parser("status")
+    st.add_argument("run_id")
+    st.set_defaults(func=cmd_status)
 
     s = sub.add_parser("serve")
     s.add_argument("--port", type=int, default=9700)

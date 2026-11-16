@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .dag import load, validate
+from .ready import summarize_instances
 from .runner import run_dag
 from .store import Store
 from . import schedule
@@ -56,6 +57,22 @@ class Handler(BaseHTTPRequestHandler):
             if detail is None:
                 return self._json(404, {"error": "run not found"})
             return self._json(200, detail)
+
+        if u.path.startswith("/tasks/"):
+            # /tasks/<run_id>[/<task>]：实例级状态与汇总。
+            parts = u.path.split("/", 3)
+            run_id = parts[2]
+            task = parts[3] if len(parts) > 3 and parts[3] else None
+            if _STORE.get_run(run_id) is None:
+                return self._json(404, {"error": "run not found"})
+            instances = _STORE.latest_instances(run_id, task)
+            summary = summarize_instances(instances)
+            return self._json(200, {
+                "run_id": run_id,
+                "task": task,
+                "summary": summary.as_dict(),
+                "instances": instances,
+            })
 
         return self._json(404, {"error": "not found"})
 
