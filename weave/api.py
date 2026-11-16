@@ -8,8 +8,10 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .dag import load, validate
+from .rerun import RerunConfigError, execute_plan, plan_reruns
 from .runner import run_dag
-from .store import Store
+from .schedule import ScheduleError
+from .store import RunAlreadyRunning, Store
 from . import schedule
 
 _STORE: Store | None = None
@@ -29,6 +31,23 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _body(self) -> dict:
+        """解析 JSON 或表单请求体；空体返回 {}。"""
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        ctype = self.headers.get("Content-Type", "")
+        if "application/json" in ctype:
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid json body: {exc}") from exc
+            if not isinstance(data, dict):
+                raise ValueError("json body must be an object")
+            return data
+        return {k: v[0] for k, v in parse_qs(raw.decode("utf-8")).items()}
+
     def do_GET(self):  # noqa: N802
         u = urlparse(self.path)
         q = parse_qs(u.query)
@@ -47,7 +66,6 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/runs":
             limit = int(q.get("limit", ["20"])[0])
             offset = int(q.get("offset", ["0"])[0])
-            # offset 目前被忽略。
             return self._json(200, {"runs": _STORE.list_runs(limit=limit, offset=offset)})
 
         if u.path.startswith("/status/"):
@@ -59,24 +77,92 @@ class Handler(BaseHTTPRequestHandler):
 
         return self._json(404, {"error": "not found"})
 
+    def _find_dag(self, name: str):
+        for p in sorted(_DAGS_DIR.glob("*.yaml")):
+            d = load(p)
+            if d.name == name:
+                return d
+        return None
+
+    def _handle_window_request(self, name: str, body: dict, *, mode: str):
+        """catchup / rerun 共用的规划+执行逻辑，输出逐窗口解释。"""
+        dag = self._find_dag(name)
+        if dag is None:
+            return self._json(404, {"error": "dag not found"})
+        problems = validate(dag)
+        if problems:
+            return self._json(422, {"error": "invalid dag", "problems": problems})
+
+        try:
+            kwargs = {"on_exists": body.get("on_exists", "retry")}
+            if "stale_after" in body:
+                kwargs["stale_after"] = float(body["stale_after"])
+            if "max_windows" in body:
+                kwargs["max_windows"] = int(body["max_windows"])
+            plan = plan_reruns(dag, _STORE, start=body.get("start"),
+                               end=body.get("end"), **kwargs)
+        except (RerunConfigError, ScheduleError) as exc:
+            return self._json(400, {"error": str(exc)})
+
+        dry_run = bool(body.get("dry_run", False))
+        if dry_run:
+            return self._json(200, {"plan": plan.to_dict()})
+
+        report = execute_plan(
+            plan, dag, _STORE, _JOBS_DIR,
+            timeout=int(body.get("timeout", 60)),
+            continue_on_fail=bool(body.get("continue_on_fail", False)),
+        )
+        code = 200
+        if any(e.status in ("failed", "interrupted") for e in report.entries) or report.stopped_early:
+            code = 409
+        return self._json(code, {"plan": plan.to_dict(), "execution": report.to_dict()})
+
     def do_POST(self):  # noqa: N802
         u = urlparse(self.path)
+        try:
+            body = self._body()
+        except ValueError as exc:
+            return self._json(400, {"error": str(exc)})
+
+        if u.path.startswith("/catchup/"):
+            name = u.path.split("/catchup/", 1)[1]
+            return self._handle_window_request(name, body, mode="catchup")
+
+        if u.path.startswith("/rerun/"):
+            name = u.path.split("/rerun/", 1)[1]
+            return self._handle_window_request(name, body, mode="rerun")
+
         if u.path.startswith("/run/"):
             name = u.path.split("/run/", 1)[1]
-            dag = None
-            for p in sorted(_DAGS_DIR.glob("*.yaml")):
-                d = load(p)
-                if d.name == name:
-                    dag = d
-                    break
+            dag = self._find_dag(name)
             if dag is None:
                 return self._json(404, {"error": "dag not found"})
             problems = validate(dag)
             if problems:
                 return self._json(422, {"error": "invalid dag", "problems": problems})
-            ds = schedule.ds_of(__import__("time").time())
-            run_id, statuses = run_dag(dag, _STORE, ds, _JOBS_DIR)
-            return self._json(200, {"run_id": run_id, "statuses": statuses})
+            ds_raw = body.get("ds")
+            sched = dag.schedule or "day"
+            try:
+                if ds_raw:
+                    lo, _ = schedule.parse_bound(sched, ds_raw)
+                    ds = schedule.window_ds(sched, lo)
+                else:
+                    ds = schedule.window_ds(sched, schedule.time.time())
+            except ScheduleError as exc:
+                return self._json(400, {"error": str(exc)})
+            try:
+                run_id, statuses = run_dag(
+                    dag, _STORE, ds, _JOBS_DIR,
+                    timeout=int(body.get("timeout", 60)),
+                    guard=not bool(body.get("no_guard", False)),
+                )
+            except RunAlreadyRunning as exc:
+                return self._json(409, {
+                    "error": "window already running",
+                    "ds": ds, "run_id": exc.run_id, "reason": str(exc),
+                })
+            return self._json(200, {"run_id": run_id, "ds": ds, "statuses": statuses})
         return self._json(404, {"error": "not found"})
 
 
