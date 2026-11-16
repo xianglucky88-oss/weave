@@ -1,11 +1,17 @@
-"""DAG 定义：解析 YAML、校验结构、检测依赖环。"""
+"""DAG 定义：数据结构、拓扑序、兼容门面。
+
+校验契约已迁移到 weave.check：
+- load()     只保证「能解析、结构合法」，否则抛 ValueError（稳定消息）
+- validate() 返回错误消息列表，是 check.check_dag 的兼容包装
+- order()    拓扑序与 runner 的就绪循环同构（见 waves）
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import yaml
+from .ready import Status, ready_tasks
 
 
 @dataclass
@@ -28,62 +34,46 @@ class DAG:
     def by_name(self) -> dict[str, Task]:
         return {t.name: t for t in self.tasks}
 
-    def order(self) -> list[str]:
-        """拓扑序。调用前必须已通过 validate。"""
-        indeg = {t.name: len(t.depends_on) for t in self.tasks}
-        children: dict[str, list[str]] = {t.name: [] for t in self.tasks}
-        for t in self.tasks:
-            for dep in t.depends_on:
-                children[dep].append(t.name)
+    def waves(self) -> list[list[str]]:
+        """执行波次：与 runner 的就绪循环完全同构。
 
-        queue = [n for n, d in indeg.items() if d == 0]
-        out: list[str] = []
-        while queue:
-            n = queue.pop(0)
-            out.append(n)
-            for c in children[n]:
-                indeg[c] -= 1
-                if indeg[c] == 0:
-                    queue.append(c)
+        每一波 = 所有依赖都已 SUCCESS 的任务（按定义顺序），
+        对应 runner 里一轮 while 循环执行的 ready_tasks。
+        """
+        statuses = {t.name: Status.PENDING for t in self.tasks}
+        out: list[list[str]] = []
+        done = 0
+        while done < len(self.tasks):
+            ready = ready_tasks(self, statuses)
+            if not ready:
+                break
+            out.append(ready)
+            for n in ready:
+                statuses[n] = Status.SUCCESS
+            done += len(ready)
         return out
+
+    def order(self) -> list[str]:
+        """拓扑序，与 runner 实际采用的执行顺序一致。调用前必须已通过校验。"""
+        return [n for wave in self.waves() for n in wave]
 
 
 def load(path: Path) -> DAG:
-    """从 YAML 文件加载 DAG。"""
-    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict) or "tasks" not in raw:
-        raise ValueError(f"{path}: DAG must contain a 'tasks' list")
+    """从 YAML 文件加载 DAG。
 
-    tasks: list[Task] = []
-    for item in raw["tasks"]:
-        tasks.append(
-            Task(
-                name=item["name"],
-                script=item["script"],
-                depends_on=list(item.get("depends_on", [])),
-                retries=int(item.get("retries", 0)),
-                sla_seconds=int(item.get("sla_seconds", 0)),
-                params=dict(item.get("params", {})),
-            )
-        )
-    return DAG(name=raw["name"], tasks=tasks, schedule=raw.get("schedule", ""))
+    解析或结构不合法时抛 ValueError（稳定的第一条诊断消息）；
+    依赖级问题不在此检查，完整契约见 weave.check.check_file。
+    """
+    from .check import load_definition
+
+    return load_definition(Path(path))
 
 
 def validate(dag: DAG) -> list[str]:
-    """返回问题列表；空列表表示通过。"""
-    problems: list[str] = []
-    names = [t.name for t in dag.tasks]
-    if len(names) != len(set(names)):
-        problems.append("duplicate task names")
+    """返回错误消息列表；空列表表示通过。
 
-    known = set(names)
-    for t in dag.tasks:
-        for dep in t.depends_on:
-            if dep not in known:
-                problems.append(f"task {t.name!r} depends on unknown {dep!r}")
+    兼容包装：结构化诊断（错误码/阶段/定位）见 weave.check.check_dag。
+    """
+    from .check import check_dag
 
-    if not problems:
-        order = dag.order()
-        if len(order) != len(dag.tasks):
-            problems.append("dependency cycle detected")
-    return problems
+    return [d.message for d in check_dag(dag).errors]

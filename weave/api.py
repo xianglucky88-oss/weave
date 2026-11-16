@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .dag import load, validate
+from .check import check_file, find_dag_file
 from .runner import run_dag
 from .store import Store
 from . import schedule
@@ -39,9 +39,15 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/dags":
             out = []
             for p in sorted(_DAGS_DIR.glob("*.yaml")):
-                d = load(p)
-                out.append({"name": d.name, "tasks": [t.name for t in d.tasks],
-                            "schedule": d.schedule, "problems": validate(d)})
+                r = check_file(p, jobs_dir=_JOBS_DIR)
+                out.append({
+                    "name": r.dag_name,
+                    "file": p.name,
+                    "tasks": [t.name for t in r.dag.tasks] if r.dag else [],
+                    "schedule": r.dag.schedule if r.dag else "",
+                    "ok": r.ok,
+                    "problems": [f"{d.code}: {d.message}" for d in r.errors],
+                })
             return self._json(200, {"dags": out})
 
         if u.path == "/runs":
@@ -63,19 +69,18 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if u.path.startswith("/run/"):
             name = u.path.split("/run/", 1)[1]
-            dag = None
-            for p in sorted(_DAGS_DIR.glob("*.yaml")):
-                d = load(p)
-                if d.name == name:
-                    dag = d
-                    break
-            if dag is None:
+            try:
+                path = find_dag_file(name, _DAGS_DIR)
+            except FileNotFoundError:
                 return self._json(404, {"error": "dag not found"})
-            problems = validate(dag)
-            if problems:
-                return self._json(422, {"error": "invalid dag", "problems": problems})
+            report = check_file(path, jobs_dir=_JOBS_DIR)
+            if not report.ok:
+                return self._json(422, {
+                    "error": "invalid dag",
+                    "problems": [f"{d.code}: {d.message}" for d in report.errors],
+                })
             ds = schedule.ds_of(__import__("time").time())
-            run_id, statuses = run_dag(dag, _STORE, ds, _JOBS_DIR)
+            run_id, statuses = run_dag(report.dag, _STORE, ds, _JOBS_DIR)
             return self._json(200, {"run_id": run_id, "statuses": statuses})
         return self._json(404, {"error": "not found"})
 
