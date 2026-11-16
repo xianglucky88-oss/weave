@@ -3,12 +3,21 @@ schedule: hour
 tasks:
   - name: extract
     script: extract.py
-    retries: 1
+    retries: 2
+    # 指数退避：1s -> 2s -> 4s（backoff_max 截断），抖动 ±20%
+    backoff_base: 1
+    backoff_factor: 2
+    backoff_max: 4
+    retry_jitter: 0.2
+    # 退出码 2 视为参数错误，永久失败、不再重试
+    fatal_exit_codes: [2]
+    timeout: 10
     sla_seconds: 10
   - name: transform
     script: transform.py
     depends_on: [extract]
     retries: 1
+    backoff_base: 1
   - name: load
     script: load.py
     depends_on: [transform]

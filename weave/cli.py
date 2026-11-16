@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -59,9 +61,24 @@ def cmd_run(args) -> int:
         return 1
     store = Store(DB_PATH)
     ds = args.ds or schedule.ds_of(time.time())
-    run_id, statuses = run_dag(d, store, ds, JOBS, timeout=args.timeout)
+
+    # SIGTERM/SIGINT 置位停止事件：runner 会中断退避、终止在跑的子进程，
+    # 并把 run 收敛到 canceled，而不是被强杀后留下残留进程和悬挂状态。
+    shutdown = threading.Event()
+
+    def _ask_stop(signum, _frame):
+        print(f"\nreceived signal {signum}, shutting down ...", file=sys.stderr)
+        shutdown.set()
+
+    signal.signal(signal.SIGTERM, _ask_stop)
+    signal.signal(signal.SIGINT, _ask_stop)
+
+    run_id, statuses = run_dag(d, store, ds, JOBS, timeout=args.timeout,
+                               max_output=args.max_output, shutdown=shutdown)
     print(json.dumps({"run_id": run_id, "ds": ds, "statuses": statuses},
                      ensure_ascii=False, indent=2))
+    if shutdown.is_set():
+        return 130
     return 0 if all(v == "success" for v in statuses.values()) else 1
 
 
@@ -85,6 +102,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("dag")
     r.add_argument("--ds", default="")
     r.add_argument("--timeout", type=int, default=60)
+    r.add_argument("--max-output", type=int, default=None,
+                   help="单个任务保留的输出字节上限，默认由执行层决定(64KiB)")
     r.set_defaults(func=cmd_run)
 
     s = sub.add_parser("serve")

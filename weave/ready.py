@@ -28,15 +28,23 @@ def ready_tasks(dag, statuses: dict[str, Status]) -> list[str]:
 
 
 def propagate_failure(dag, statuses: dict[str, Status]) -> None:
-    """上游失败时，把下游标记为跳过。
+    """上游失败时，把所有（含间接）下游递归标记为跳过。
 
-    当前实现只处理一层直接下游，没有递归传播。
+    用不动点迭代实现：只要还有 PENDING 任务的任一依赖已 FAILED/SKIPPED，
+    就把它置为 SKIPPED，反复扫描直到一轮没有变化。DAG 无环（validate
+    已保证），所以迭代必然收敛，失败能沿依赖链传播到任意深度。
     """
-    for t in dag.tasks:
-        if statuses.get(t.name) != Status.PENDING:
-            continue
-        if any(statuses.get(d) == Status.FAILED for d in t.depends_on):
-            statuses[t.name] = Status.SKIPPED
+    blocked = (Status.FAILED, Status.SKIPPED)
+    while True:
+        changed = False
+        for t in dag.tasks:
+            if statuses.get(t.name) != Status.PENDING:
+                continue
+            if any(statuses.get(d) in blocked for d in t.depends_on):
+                statuses[t.name] = Status.SKIPPED
+                changed = True
+        if not changed:
+            return
 
 
 def is_done(dag, statuses: dict[str, Status]) -> bool:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import signal
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -15,6 +17,8 @@ from . import schedule
 _STORE: Store | None = None
 _DAGS_DIR: Path | None = None
 _JOBS_DIR: Path | None = None
+# 服务级停止事件：信号置位后，进行中的运行会中断退避并清理子进程。
+_SHUTDOWN: threading.Event | None = None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -75,14 +79,32 @@ class Handler(BaseHTTPRequestHandler):
             if problems:
                 return self._json(422, {"error": "invalid dag", "problems": problems})
             ds = schedule.ds_of(__import__("time").time())
-            run_id, statuses = run_dag(dag, _STORE, ds, _JOBS_DIR)
+            run_id, statuses = run_dag(dag, _STORE, ds, _JOBS_DIR,
+                                       shutdown=_SHUTDOWN)
             return self._json(200, {"run_id": run_id, "statuses": statuses})
         return self._json(404, {"error": "not found"})
 
 
 def serve(store: Store, dags_dir: Path, jobs_dir: Path, port: int = 9700) -> None:
-    global _STORE, _DAGS_DIR, _JOBS_DIR
+    global _STORE, _DAGS_DIR, _JOBS_DIR, _SHUTDOWN
     _STORE, _DAGS_DIR, _JOBS_DIR = store, dags_dir, jobs_dir
+    _SHUTDOWN = threading.Event()
+
     httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+
+    def _ask_stop(signum, _frame):
+        # 信号在主线程送达，而 serve_forever 也跑在主线程；
+        # shutdown() 必须由另一个线程调用，否则与 serve_forever 互锁。
+        _SHUTDOWN.set()
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _ask_stop)
+    signal.signal(signal.SIGINT, _ask_stop)
+
     print(f"weave api listening on http://127.0.0.1:{port}")
-    httpd.serve_forever()
+    try:
+        httpd.serve_forever()
+    finally:
+        # 等待在途请求（可能正在跑 DAG）结束，再关闭监听套接字。
+        httpd.server_close()
+        print("weave api stopped")

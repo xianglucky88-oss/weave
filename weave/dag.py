@@ -16,6 +16,17 @@ class Task:
     retries: int = 0
     sla_seconds: int = 0
     params: dict[str, str] = field(default_factory=dict)
+    # --- 重试/执行语义（均可在 YAML 中按任务覆盖）---
+    # 指数退避基数（秒，0 表示立即重试）、乘数、上限、抖动比例(0~1)。
+    backoff_base: float = 0.0
+    backoff_factor: float = 2.0
+    backoff_max: float = 30.0
+    retry_jitter: float = 0.0
+    # 这些退出码视为永久失败，不再重试。
+    fatal_exit_codes: list[int] = field(default_factory=list)
+    # 任务级超时（秒）与输出上限（字节）；0 表示沿用运行入口的默认值。
+    timeout: int = 0
+    max_output: int = 0
 
 
 @dataclass
@@ -64,6 +75,13 @@ def load(path: Path) -> DAG:
                 retries=int(item.get("retries", 0)),
                 sla_seconds=int(item.get("sla_seconds", 0)),
                 params=dict(item.get("params", {})),
+                backoff_base=float(item.get("backoff_base", 0.0)),
+                backoff_factor=float(item.get("backoff_factor", 2.0)),
+                backoff_max=float(item.get("backoff_max", 30.0)),
+                retry_jitter=float(item.get("retry_jitter", 0.0)),
+                fatal_exit_codes=[int(c) for c in item.get("fatal_exit_codes", [])],
+                timeout=int(item.get("timeout", 0)),
+                max_output=int(item.get("max_output", 0)),
             )
         )
     return DAG(name=raw["name"], tasks=tasks, schedule=raw.get("schedule", ""))
